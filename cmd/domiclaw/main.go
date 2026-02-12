@@ -42,6 +42,8 @@ func main() {
 		runAgent(os.Args[2:])
 	case "chat":
 		runChat(os.Args[2:])
+	case "auto":
+		runAuto(os.Args[2:])
 	case "resume":
 		runResume()
 	case "status":
@@ -64,6 +66,7 @@ Commands:
   init      Initialize workspace and config
   run       Run agent with a single prompt
   chat      Interactive chat mode (REPL)
+  auto      Autonomous mode - self-directed task execution
   resume    Resume from last session (after context overflow)
   status    Show current status
   version   Show version information
@@ -74,6 +77,7 @@ Examples:
   domiclaw run -m "Help me refactor this code"
   domiclaw chat                    # Enter interactive mode
   domiclaw chat -w /path/to/proj   # Chat in specific directory
+  domiclaw auto "逆向 Claude Code 插件，开发完整版桌面应用"
   domiclaw resume
 
 Environment Variables:
@@ -449,6 +453,80 @@ Type your message and press Enter. Commands:
 		}
 		fmt.Println()
 	}
+}
+
+func runAuto(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Error: Please provide a task description.")
+		fmt.Println("Usage: domiclaw auto \"your task description\"")
+		os.Exit(1)
+	}
+
+	// Join all args as the task description
+	task := strings.Join(args, " ")
+
+	// Load config
+	cfg, err := config.Load()
+	if err != nil {
+		logger.ErrorF("Failed to load config", map[string]interface{}{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+
+	// Create agent loop
+	loop, err := agent.NewLoop(cfg)
+	if err != nil {
+		logger.ErrorF("Failed to create agent", map[string]interface{}{
+			"error": err.Error(),
+		})
+		fmt.Printf("\nError: %s\n", err.Error())
+		fmt.Println("\nMake sure ANTHROPIC_API_KEY is set.")
+		os.Exit(1)
+	}
+
+	// Setup context with signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Handle Ctrl+C gracefully
+	go func() {
+		<-sigChan
+		fmt.Println("\n\n[Autonomous mode interrupted]")
+		loop.Stop()
+		cancel()
+		os.Exit(0)
+	}()
+
+	// Print header
+	cwd, _ := os.Getwd()
+	fmt.Printf(`
+╔══════════════════════════════════════════════════════════════════╗
+║              DomiClaw Autonomous Mode                            ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Workspace: %s
+Task: %s
+
+Starting autonomous execution... (Ctrl+C to stop)
+
+`, cwd, task)
+
+	// Run autonomous loop
+	if err := loop.RunAutonomous(ctx, task); err != nil {
+		if err == context.Canceled {
+			return
+		}
+		logger.ErrorF("Autonomous mode error", map[string]interface{}{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+
+	fmt.Println("\n[Autonomous mode completed]")
 }
 
 func boolToStatus(b bool) string {

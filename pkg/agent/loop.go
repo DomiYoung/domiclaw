@@ -666,6 +666,313 @@ func (l *Loop) GetTools() *tools.Registry {
 	return l.tools
 }
 
+// RunAutonomous runs the agent in fully autonomous mode.
+// The agent will plan, execute, iterate, and self-evaluate until the task is complete.
+func (l *Loop) RunAutonomous(ctx context.Context, taskDescription string) error {
+	l.mu.Lock()
+	if l.running {
+		l.mu.Unlock()
+		return fmt.Errorf("agent is already running")
+	}
+	l.running = true
+	l.stopChan = make(chan struct{})
+	l.mu.Unlock()
+
+	defer func() {
+		l.mu.Lock()
+		l.running = false
+		l.mu.Unlock()
+	}()
+
+	// Build autonomous system prompt
+	autonomousPrompt := l.buildAutonomousSystemPrompt(taskDescription)
+
+	// Initialize messages
+	l.messages = []providers.Message{
+		{Role: "system", Content: autonomousPrompt},
+		{Role: "user", Content: fmt.Sprintf(`Execute this task autonomously:
+
+%s
+
+Work through this step by step:
+1. First, analyze the current state (list files, read relevant code)
+2. Create a plan with specific milestones
+3. Execute each step, verifying results
+4. If you encounter errors, debug and fix them
+5. Continue until the task is fully complete
+
+When you have completed the entire task, end your response with: [TASK_COMPLETE]
+
+If you need to pause or cannot continue, end with: [TASK_PAUSED]
+
+Begin now.`, taskDescription)},
+	}
+	l.toolDefs = l.buildToolDefinitions()
+
+	// Log to daily notes
+	l.memory.AppendToday(fmt.Sprintf(`## Autonomous Task Started
+
+Time: %s
+Task: %s
+`, time.Now().Format("15:04:05"), taskDescription))
+
+	// Run autonomous loop - continues until task complete or error
+	maxCycles := 100 // Safety limit
+	for cycle := 0; cycle < maxCycles; cycle++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-l.stopChan:
+			return nil
+		default:
+		}
+
+		fmt.Printf("\n--- Cycle %d ---\n", cycle+1)
+
+		// Run one cycle
+		completed, err := l.runAutonomousCycle(ctx)
+		if err != nil {
+			if l.detectContextOverflow(err) {
+				// Save state for resume
+				l.memory.WriteResumeTrigger(fmt.Sprintf("auto_%d", time.Now().Unix()), "context_overflow")
+				l.memory.WriteResumePrompt(fmt.Sprintf("Continue autonomous task: %s", taskDescription))
+				return fmt.Errorf("context overflow - run 'domiclaw resume' to continue")
+			}
+			// Log error but try to continue
+			logger.WarnCF("auto", "Cycle error, continuing", map[string]interface{}{
+				"cycle": cycle,
+				"error": err.Error(),
+			})
+			// Add error to context so agent can learn from it
+			l.messages = append(l.messages, providers.Message{
+				Role:    "user",
+				Content: fmt.Sprintf("An error occurred: %s\n\nPlease analyze this error and continue with the task.", err.Error()),
+			})
+			continue
+		}
+
+		if completed {
+			l.memory.AppendToday(fmt.Sprintf(`## Autonomous Task Completed
+
+Time: %s
+Cycles: %d
+`, time.Now().Format("15:04:05"), cycle+1))
+			return nil
+		}
+
+		// Add continuation prompt if agent stopped without completing
+		lastMsg := ""
+		if len(l.messages) > 0 {
+			lastMsg = l.messages[len(l.messages)-1].Content
+		}
+		if !strings.Contains(lastMsg, "TASK_COMPLETE") && !strings.Contains(lastMsg, "TASK_PAUSED") {
+			l.messages = append(l.messages, providers.Message{
+				Role:    "user",
+				Content: "Continue with the task. What's the next step?",
+			})
+		}
+	}
+
+	return fmt.Errorf("max cycles (%d) reached", maxCycles)
+}
+
+// runAutonomousCycle runs a single cycle of autonomous execution.
+// Returns true if the task is complete.
+func (l *Loop) runAutonomousCycle(ctx context.Context) (bool, error) {
+	var lastToolSig string
+	repeatCount := 0
+	const maxRepeats = 2
+
+	for iteration := 0; iteration < l.cfg.Agents.MaxToolIterations; iteration++ {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-l.stopChan:
+			return false, nil
+		default:
+		}
+
+		// Call LLM with streaming
+		var resp *providers.Response
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			resp, err = l.provider.ChatStream(ctx, l.messages, l.toolDefs, l.cfg.Agents.Model, map[string]interface{}{
+				"max_tokens":  l.cfg.Agents.MaxTokens,
+				"temperature": l.cfg.Agents.Temperature,
+			}, func(event providers.StreamEvent) {
+				switch event.Type {
+				case "text":
+					fmt.Print(event.Text)
+				case "tool_start":
+					fmt.Printf("\n[tool: %s] ", event.Name)
+				}
+			})
+			if err == nil {
+				break
+			}
+			errStr := strings.ToLower(err.Error())
+			if strings.Contains(errStr, "rate_limit") || strings.Contains(errStr, "too many") || strings.Contains(errStr, "429") {
+				backoff := time.Duration(5*(attempt+1)) * time.Second
+				logger.WarnCF("auto", "Rate limited, retrying", map[string]interface{}{
+					"attempt": attempt + 1,
+					"backoff": backoff.String(),
+				})
+				select {
+				case <-ctx.Done():
+					return false, ctx.Err()
+				case <-l.stopChan:
+					return false, nil
+				case <-time.After(backoff):
+					continue
+				}
+			}
+			break
+		}
+
+		if err != nil {
+			return false, err
+		}
+
+		logger.InfoCF("auto", "LLM response", map[string]interface{}{
+			"tokens_in":  resp.Usage.PromptTokens,
+			"tokens_out": resp.Usage.CompletionTokens,
+			"tools":      len(resp.ToolCalls),
+		})
+
+		// Check for completion markers
+		if strings.Contains(resp.Content, "[TASK_COMPLETE]") {
+			l.messages = append(l.messages, providers.Message{
+				Role:    "assistant",
+				Content: resp.Content,
+			})
+			return true, nil
+		}
+
+		if strings.Contains(resp.Content, "[TASK_PAUSED]") {
+			l.messages = append(l.messages, providers.Message{
+				Role:    "assistant",
+				Content: resp.Content,
+			})
+			return false, fmt.Errorf("task paused by agent")
+		}
+
+		// No tool calls = end of cycle (agent is thinking/responding)
+		if len(resp.ToolCalls) == 0 {
+			l.messages = append(l.messages, providers.Message{
+				Role:    "assistant",
+				Content: resp.Content,
+			})
+			return false, nil // Not complete, but cycle done
+		}
+
+		// Build assistant message with tool calls
+		assistantMsg := providers.Message{
+			Role:    "assistant",
+			Content: resp.Content,
+		}
+		for _, tc := range resp.ToolCalls {
+			resolvedName := l.tools.ResolveName(tc.Name)
+			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
+				ID:        tc.ID,
+				Type:      "function",
+				Name:      resolvedName,
+				Arguments: tc.Arguments,
+				Function:  tc.Function,
+			})
+		}
+		l.messages = append(l.messages, assistantMsg)
+
+		// Execute tool calls
+		for _, tc := range resp.ToolCalls {
+			resolvedName := l.tools.ResolveName(tc.Name)
+			logger.InfoCF("auto", fmt.Sprintf("Tool: %s", resolvedName), map[string]interface{}{
+				"args": utils.Truncate(fmt.Sprintf("%v", tc.Arguments), 100),
+			})
+
+			result, err := l.tools.Execute(ctx, tc.Name, tc.Arguments)
+			if err != nil {
+				result = fmt.Sprintf("Error: %v", err)
+				logger.WarnCF("auto", "Tool error", map[string]interface{}{
+					"tool":  resolvedName,
+					"error": err.Error(),
+				})
+			}
+
+			displayResult := utils.Truncate(result, 200)
+			fmt.Printf("  → %s\n", displayResult)
+
+			l.messages = append(l.messages, providers.Message{
+				Role:       "tool",
+				Content:    result,
+				ToolCallID: tc.ID,
+			})
+		}
+
+		// Loop-breaking for repeated tool calls
+		currentSig := marshalArgs(resp.ToolCalls[0].Arguments) + ":" + resp.ToolCalls[0].Name
+		if currentSig == lastToolSig {
+			repeatCount++
+			if repeatCount >= maxRepeats {
+				logger.WarnCF("auto", "Breaking tool loop", map[string]interface{}{
+					"tool": resp.ToolCalls[0].Name,
+				})
+				l.messages = append(l.messages, providers.Message{
+					Role:    "user",
+					Content: "You are repeating the same tool call. Please use the results and move on to the next step.",
+				})
+				lastToolSig = ""
+				repeatCount = 0
+			}
+		} else {
+			lastToolSig = currentSig
+			repeatCount = 0
+		}
+	}
+
+	return false, nil // Max iterations, cycle ends
+}
+
+// buildAutonomousSystemPrompt creates the system prompt for autonomous mode.
+func (l *Loop) buildAutonomousSystemPrompt(taskDescription string) string {
+	toolNames := strings.Join(l.tools.List(), ", ")
+
+	basePrompt := fmt.Sprintf(`You are DomiClaw, an autonomous AI coding agent. You work independently to complete complex software engineering tasks.
+
+You have these tools: %s
+
+Tool usage:
+- "exec" - run shell commands (the argument is "command")
+- "read_file" - read file contents (argument: "path")
+- "write_file" - create/overwrite files (arguments: "path", "content")
+- "edit_file" - targeted edits (arguments: "path", "old_string", "new_string")
+- "list_dir" - list directory (argument: "path")
+- "glob" - find files by pattern (argument: "pattern")
+- "grep" - search file contents (arguments: "pattern", optionally "path", "include")
+- "web_search" - search the web (argument: "query")
+
+AUTONOMOUS MODE GUIDELINES:
+1. **Plan First**: Before coding, understand the current state and create a clear plan
+2. **Work Incrementally**: Complete one step fully before moving to the next
+3. **Verify Results**: After each action, verify it worked as expected
+4. **Handle Errors**: If something fails, debug and fix it before continuing
+5. **Stay Focused**: Keep working on the task until it's fully complete
+6. **Signal Completion**: When done, include "[TASK_COMPLETE]" in your response
+7. **Signal Pause**: If you truly cannot continue, include "[TASK_PAUSED]" with explanation
+
+You can run shell commands, create/edit files, search code, and browse the web. Use all tools available to complete the task.
+
+IMPORTANT: Only use the exact tool names listed above. Do NOT use "Bash", "Read", "Write", etc.
+`, toolNames)
+
+	// Add memory context
+	memoryCtx := l.memory.GetMemoryContext(l.cfg.Memory.DailyNotesDays)
+	if memoryCtx != "" {
+		basePrompt += "\n---\n\n" + memoryCtx
+	}
+
+	return basePrompt
+}
+
 // Helper for JSON marshaling tool call arguments
 func marshalArgs(args map[string]interface{}) string {
 	data, _ := json.Marshal(args)
