@@ -45,6 +45,8 @@ func NewLoop(cfg *config.Config) (*Loop, error) {
 	toolRegistry.Register(&tools.WriteFileTool{Workspace: cfg.WorkspacePath()})
 	toolRegistry.Register(&tools.ListDirTool{})
 	toolRegistry.Register(&tools.EditFileTool{Workspace: cfg.WorkspacePath()})
+	toolRegistry.Register(&tools.GlobTool{Workspace: cfg.WorkspacePath()})
+	toolRegistry.Register(&tools.GrepTool{Workspace: cfg.WorkspacePath()})
 	toolRegistry.Register(tools.NewExecTool(cfg.WorkspacePath()))
 
 	// Register web search if API key available

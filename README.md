@@ -123,6 +123,8 @@ Config file: `~/.domiclaw/config.json`
 | `write_file` | Write content to file |
 | `edit_file` | Precise string replacement in files |
 | `list_dir` | List directory contents |
+| `glob` | Search files by pattern (supports `**/*.go`) |
+| `grep` | Search file contents with regex |
 | `exec` | Execute shell commands (with dangerous command blocking) |
 | `web_search` | Search the web (Brave or Tavily) |
 
