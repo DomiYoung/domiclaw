@@ -1,4 +1,4 @@
-// DomiClaw - Ultra-lightweight Pi Agent runner
+// DomiClaw - Ultra-lightweight AI coding assistant
 // Inspired by PicoClaw and OpenClaw
 package main
 
@@ -52,13 +52,13 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Printf(`DomiClaw - Ultra-lightweight Pi Agent runner
+	fmt.Printf(`DomiClaw - Ultra-lightweight AI coding assistant
 
 Usage: domiclaw <command> [options]
 
 Commands:
   init      Initialize workspace and config
-  run       Run Pi Agent with a prompt
+  run       Run agent with a prompt
   resume    Resume from last session (after context overflow)
   status    Show current status
   version   Show version information
@@ -69,6 +69,10 @@ Examples:
   domiclaw run -m "Help me refactor this code"
   domiclaw run --workspace /path/to/project
   domiclaw resume
+
+Environment Variables:
+  ANTHROPIC_API_KEY    Anthropic API key (required)
+  BRAVE_API_KEY        Brave Search API key (optional)
 
 Configuration: ~/.domiclaw/config.json
 `)
@@ -99,7 +103,7 @@ func runInit() {
 		initialMemory := `# DomiClaw Memory
 
 ## Identity
-- I am DomiClaw, a Pi Agent runner with persistent memory
+- I am DomiClaw, an AI coding assistant with persistent memory
 - I remember context across sessions through this file
 
 ## Preferences
@@ -119,9 +123,9 @@ Workspace: %s
 Config:    %s
 
 Next steps:
-1. Edit config if needed: %s
+1. Set your API key: export ANTHROPIC_API_KEY="your-key"
 2. Run: domiclaw run -m "Your prompt here"
-`, cfg.WorkspacePath(), config.ConfigPath(), config.ConfigPath())
+`, cfg.WorkspacePath(), config.ConfigPath())
 }
 
 func runAgent(args []string) {
@@ -163,6 +167,18 @@ func runAgent(args []string) {
 		cfg.Workspace = workspace
 	}
 
+	// Create agent loop
+	loop, err := agent.NewLoop(cfg)
+	if err != nil {
+		logger.ErrorF("Failed to create agent", map[string]interface{}{
+			"error": err.Error(),
+		})
+		fmt.Printf("\nError: %s\n", err.Error())
+		fmt.Println("\nMake sure ANTHROPIC_API_KEY is set:")
+		fmt.Println("  export ANTHROPIC_API_KEY=\"your-api-key\"")
+		os.Exit(1)
+	}
+
 	// Setup context with signal handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -170,16 +186,12 @@ func runAgent(args []string) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Create and run agent loop
-	loop := agent.NewLoop(cfg)
-
 	// Start heartbeat if enabled
 	var hb *heartbeat.Service
 	if cfg.Heartbeat.Enabled {
 		hb = heartbeat.NewService(
 			cfg.WorkspacePath(),
 			func(p string) (string, error) {
-				// Heartbeat callback - could trigger agent action
 				logger.DebugCF("heartbeat", "Heartbeat triggered", nil)
 				return "", nil
 			},
@@ -200,7 +212,7 @@ func runAgent(args []string) {
 	select {
 	case err := <-errChan:
 		if err != nil {
-			logger.ErrorF("Agent loop error", map[string]interface{}{
+			logger.ErrorF("Agent error", map[string]interface{}{
 				"error": err.Error(),
 			})
 			os.Exit(1)
@@ -258,25 +270,34 @@ func runStatus() {
 
 	mem := memory.NewStore(cfg.WorkspacePath())
 
+	// Check API key
+	apiKeyStatus := "not set"
+	if cfg.GetAnthropicAPIKey() != "" {
+		apiKeyStatus = "configured"
+	}
+
 	fmt.Printf(`DomiClaw Status
 ===============
 
-Workspace:     %s
-Pi Agent:      %s
-Config:        %s
+Workspace:      %s
+Config:         %s
+Model:          %s
+
+API Key:        %s
 
 Memory:
-  Long-term:   %s
-  Daily dir:   %s
+  Long-term:    %v
+  Daily dir:    %s
 
-Heartbeat:     %s (every %ds)
-Strategic:     %s
+Heartbeat:      %s (every %ds)
+Strategic:      %s
 
 Pending Resume: %v
 `,
 		cfg.WorkspacePath(),
-		cfg.PiAgentPath,
 		config.ConfigPath(),
+		cfg.Agents.Model,
+		apiKeyStatus,
 		mem.ReadLongTerm() != "",
 		cfg.MemoryDir(),
 		boolToStatus(cfg.Heartbeat.Enabled),

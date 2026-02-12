@@ -12,10 +12,48 @@ import (
 // Config represents the DomiClaw configuration.
 type Config struct {
 	Workspace        string          `json:"workspace"`
-	PiAgentPath      string          `json:"pi_agent_path"`
+	Agents           AgentsConfig    `json:"agents"`
+	Providers        ProvidersConfig `json:"providers"`
+	Tools            ToolsConfig     `json:"tools"`
 	Memory           MemoryConfig    `json:"memory"`
 	Heartbeat        HeartbeatConfig `json:"heartbeat"`
 	StrategicCompact CompactConfig   `json:"strategic_compact"`
+}
+
+// AgentsConfig configures agent behavior.
+type AgentsConfig struct {
+	Model             string  `json:"model"`
+	MaxTokens         int     `json:"max_tokens"`
+	Temperature       float64 `json:"temperature"`
+	MaxToolIterations int     `json:"max_tool_iterations"`
+}
+
+// ProvidersConfig configures LLM providers.
+type ProvidersConfig struct {
+	Anthropic  *ProviderConfig `json:"anthropic,omitempty"`
+	OpenRouter *ProviderConfig `json:"openrouter,omitempty"`
+}
+
+// ProviderConfig represents a single provider's configuration.
+type ProviderConfig struct {
+	APIKey  string `json:"api_key,omitempty"`  // Optional: prefer env vars
+	APIBase string `json:"api_base,omitempty"` // Optional: custom endpoint
+}
+
+// ToolsConfig configures built-in tools.
+type ToolsConfig struct {
+	Web WebToolsConfig `json:"web"`
+}
+
+// WebToolsConfig configures web-related tools.
+type WebToolsConfig struct {
+	Search SearchConfig `json:"search"`
+}
+
+// SearchConfig configures web search.
+type SearchConfig struct {
+	APIKey     string `json:"api_key,omitempty"` // Brave/Tavily API key
+	MaxResults int    `json:"max_results"`
 }
 
 // MemoryConfig configures the memory system.
@@ -40,14 +78,30 @@ type CompactConfig struct {
 func DefaultConfig() *Config {
 	home, _ := os.UserHomeDir()
 	return &Config{
-		Workspace:   filepath.Join(home, ".domiclaw", "workspace"),
-		PiAgentPath: "/opt/homebrew/bin/pi",
+		Workspace: filepath.Join(home, ".domiclaw", "workspace"),
+		Agents: AgentsConfig{
+			Model:             "claude-sonnet-4-20250514",
+			MaxTokens:         8192,
+			Temperature:       0.7,
+			MaxToolIterations: 20,
+		},
+		Providers: ProvidersConfig{
+			// API keys should come from environment variables
+			Anthropic: &ProviderConfig{},
+		},
+		Tools: ToolsConfig{
+			Web: WebToolsConfig{
+				Search: SearchConfig{
+					MaxResults: 5,
+				},
+			},
+		},
 		Memory: MemoryConfig{
 			DailyNotesDays:         3,
 			AutoSummarizeThreshold: 0.75,
 		},
 		Heartbeat: HeartbeatConfig{
-			Enabled:         true,
+			Enabled:         false, // Disabled by default
 			IntervalSeconds: 300,
 		},
 		StrategicCompact: CompactConfig{
@@ -84,7 +138,6 @@ func LoadFrom(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Return defaults if no config file
 			return cfg, nil
 		}
 		return nil, err
@@ -97,7 +150,6 @@ func LoadFrom(path string) (*Config, error) {
 
 	// Expand paths
 	cfg.Workspace = utils.ExpandPath(cfg.Workspace)
-	cfg.PiAgentPath = utils.ExpandPath(cfg.PiAgentPath)
 
 	return cfg, nil
 }
@@ -138,4 +190,45 @@ func (c *Config) MemoryDir() string {
 // SessionsDir returns the sessions directory path.
 func (c *Config) SessionsDir() string {
 	return filepath.Join(c.WorkspacePath(), "sessions")
+}
+
+// GetAnthropicAPIKey returns the Anthropic API key.
+// Priority: 1. Environment variable, 2. Config file
+func (c *Config) GetAnthropicAPIKey() string {
+	// 1. Try environment variable first (most secure)
+	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+		return key
+	}
+
+	// 2. Fall back to config file
+	if c.Providers.Anthropic != nil && c.Providers.Anthropic.APIKey != "" {
+		return c.Providers.Anthropic.APIKey
+	}
+
+	return ""
+}
+
+// GetOpenRouterAPIKey returns the OpenRouter API key.
+func (c *Config) GetOpenRouterAPIKey() string {
+	if key := os.Getenv("OPENROUTER_API_KEY"); key != "" {
+		return key
+	}
+
+	if c.Providers.OpenRouter != nil && c.Providers.OpenRouter.APIKey != "" {
+		return c.Providers.OpenRouter.APIKey
+	}
+
+	return ""
+}
+
+// GetSearchAPIKey returns the web search API key.
+func (c *Config) GetSearchAPIKey() string {
+	if key := os.Getenv("BRAVE_API_KEY"); key != "" {
+		return key
+	}
+	if key := os.Getenv("TAVILY_API_KEY"); key != "" {
+		return key
+	}
+
+	return c.Tools.Web.Search.APIKey
 }

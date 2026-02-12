@@ -1,14 +1,33 @@
 # DomiClaw
 
-> Ultra-lightweight Pi Agent runner in Go, inspired by [PicoClaw](https://github.com/sipeed/picoclaw)
+> Ultra-lightweight AI coding assistant in Go, inspired by [PicoClaw](https://github.com/sipeed/picoclaw)
 
 ## Features
 
+- **Standalone Agent**: Direct LLM API calls, no external dependencies
 - **Memory System**: Long-term memory (MEMORY.md) + daily logs
-- **Session Management**: Conversation history with auto-summarization
-- **Gap Analysis**: Context recovery after compaction
-- **Heartbeat Service**: Periodic task checking
-- **Strategic Compact**: Smart context compression at logical boundaries
+- **Session Recovery**: Automatic gap analysis after context overflow
+- **Built-in Tools**: File operations, command execution
+- **Secure**: API keys via environment variables (never stored in config)
+- **Single Binary**: Cross-platform, ~10MB compiled
+
+## Quick Start
+
+```bash
+# Install
+git clone https://github.com/DomiYoung/domiclaw.git
+cd domiclaw
+make install
+
+# Set API key
+export ANTHROPIC_API_KEY="your-api-key"
+
+# Initialize
+domiclaw init
+
+# Run
+domiclaw run -m "Help me refactor main.go"
+```
 
 ## Architecture
 
@@ -19,7 +38,9 @@ domiclaw/
     ├── agent/          # Agent loop core
     ├── config/         # Configuration management
     ├── memory/         # Memory system (MEMORY.md, daily logs)
-    ├── session/        # Session management with summarization
+    ├── session/        # Session management
+    ├── providers/      # LLM providers (Anthropic)
+    ├── tools/          # Built-in tools
     ├── heartbeat/      # Heartbeat service
     ├── logger/         # Structured logging
     └── utils/          # Utility functions
@@ -28,44 +49,29 @@ domiclaw/
 ## Memory Directory Structure
 
 ```
-.domiclaw/
-├── MEMORY.md              # Long-term memory
-├── resume-prompt.md       # Gap Analysis result
-├── resume-trigger.json    # Session recovery trigger
-├── daily/
-│   └── YYYYMM/
-│       └── YYYYMMDD.md    # Daily logs
-└── sessions/
-    └── {session_key}.json # Session history
+~/.domiclaw/
+├── config.json            # Configuration
+└── workspace/
+    ├── MEMORY.md          # Long-term memory
+    ├── resume-prompt.md   # Gap Analysis result
+    ├── resume-trigger.json
+    ├── memory/
+    │   └── YYYYMM/
+    │       └── YYYYMMDD.md  # Daily logs
+    └── sessions/
+        └── {id}.json      # Session history
 ```
 
-## Installation
+## Commands
 
-```bash
-# From source
-git clone https://github.com/DomiYoung/domiclaw.git
-cd domiclaw
-make build
-
-# Install to PATH
-make install
-```
-
-## Usage
-
-```bash
-# Initialize workspace
-domiclaw init
-
-# Run with Pi Agent
-domiclaw run --workspace /path/to/project
-
-# Resume from last session
-domiclaw resume
-
-# Check status
-domiclaw status
-```
+| Command | Description |
+|---------|-------------|
+| `domiclaw init` | Initialize workspace and config |
+| `domiclaw run -m "prompt"` | Run agent with a prompt |
+| `domiclaw run -w /path` | Run in specific workspace |
+| `domiclaw resume` | Resume from context overflow |
+| `domiclaw status` | Show current status |
+| `domiclaw version` | Show version info |
 
 ## Configuration
 
@@ -74,13 +80,18 @@ Config file: `~/.domiclaw/config.json`
 ```json
 {
   "workspace": "~/.domiclaw/workspace",
-  "pi_agent_path": "/opt/homebrew/bin/pi",
+  "agents": {
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 8192,
+    "temperature": 0.7,
+    "max_tool_iterations": 20
+  },
   "memory": {
     "daily_notes_days": 3,
     "auto_summarize_threshold": 0.75
   },
   "heartbeat": {
-    "enabled": true,
+    "enabled": false,
     "interval_seconds": 300
   },
   "strategic_compact": {
@@ -90,11 +101,59 @@ Config file: `~/.domiclaw/config.json`
 }
 ```
 
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| `BRAVE_API_KEY` | No | Brave Search API key |
+
+**Security**: API keys are read from environment variables first. Never commit keys to config files.
+
+## Built-in Tools
+
+| Tool | Description |
+|------|-------------|
+| `read_file` | Read file contents |
+| `write_file` | Write content to file |
+| `list_dir` | List directory contents |
+| `exec` | Execute shell commands |
+
+## Comparison
+
+| Feature | DomiClaw | PicoClaw | OpenClaw |
+|---------|----------|----------|----------|
+| Language | Go | Go | TypeScript |
+| RAM | ~10MB | <10MB | >1GB |
+| Startup | <1s | <1s | >500s |
+| Dependencies | None | None | Node.js |
+| Memory System | ✅ | ✅ | ✅ |
+| Context Recovery | ✅ | ❌ | ❌ |
+
+## Development
+
+```bash
+# Build
+make build
+
+# Build for all platforms
+make build-all
+
+# Install locally
+make install
+
+# Run tests
+make test
+
+# Clean
+make clean
+```
+
 ## Inspiration
 
 - [PicoClaw](https://github.com/sipeed/picoclaw) - Ultra-lightweight AI agent in Go
-- [OpenClaw](https://github.com/openclaw/openclaw) - Memory architecture (MEMORY.md, daily logs)
-- [Pi Agent](https://github.com/mariozechner/pi-coding-agent) - The underlying coding agent
+- [OpenClaw](https://github.com/openclaw/openclaw) - Memory architecture
+- [Claude Code](https://claude.ai/code) - Agent patterns
 
 ## License
 

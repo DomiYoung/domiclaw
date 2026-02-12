@@ -2,12 +2,9 @@
 package agent
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -15,32 +12,58 @@ import (
 	"github.com/DomiYoung/domiclaw/pkg/config"
 	"github.com/DomiYoung/domiclaw/pkg/logger"
 	"github.com/DomiYoung/domiclaw/pkg/memory"
+	"github.com/DomiYoung/domiclaw/pkg/providers"
 	"github.com/DomiYoung/domiclaw/pkg/session"
+	"github.com/DomiYoung/domiclaw/pkg/tools"
+	"github.com/DomiYoung/domiclaw/pkg/utils"
 )
 
-// Loop manages the Pi Agent execution loop.
+// Loop manages the agent execution loop.
 type Loop struct {
 	cfg      *config.Config
+	provider providers.Provider
 	memory   *memory.Store
 	sessions *session.Manager
+	tools    *tools.Registry
 
-	running     bool
-	mu          sync.Mutex
-	stopChan    chan struct{}
-	currentProc *os.Process
+	running  bool
+	mu       sync.Mutex
+	stopChan chan struct{}
 }
 
 // NewLoop creates a new agent loop.
-func NewLoop(cfg *config.Config) *Loop {
+func NewLoop(cfg *config.Config) (*Loop, error) {
+	// Get API key
+	apiKey := cfg.GetAnthropicAPIKey()
+	if apiKey == "" {
+		return nil, fmt.Errorf("ANTHROPIC_API_KEY not set. Set it via environment variable or config file")
+	}
+
+	// Create provider
+	var apiBase string
+	if cfg.Providers.Anthropic != nil {
+		apiBase = cfg.Providers.Anthropic.APIBase
+	}
+	provider := providers.NewAnthropicProvider(apiKey, apiBase)
+
+	// Create tool registry
+	toolRegistry := tools.NewRegistry()
+	toolRegistry.Register(&tools.ReadFileTool{})
+	toolRegistry.Register(&tools.WriteFileTool{Workspace: cfg.WorkspacePath()})
+	toolRegistry.Register(&tools.ListDirTool{})
+	toolRegistry.Register(tools.NewExecTool(cfg.WorkspacePath()))
+
 	return &Loop{
 		cfg:      cfg,
+		provider: provider,
 		memory:   memory.NewStore(cfg.WorkspacePath()),
 		sessions: session.NewManager(cfg.SessionsDir()),
+		tools:    toolRegistry,
 		stopChan: make(chan struct{}),
-	}
+	}, nil
 }
 
-// Run starts the agent loop.
+// Run starts the agent loop with the given prompt.
 func (l *Loop) Run(ctx context.Context, initialPrompt string) error {
 	l.mu.Lock()
 	if l.running {
@@ -67,13 +90,7 @@ func (l *Loop) Run(ctx context.Context, initialPrompt string) error {
 		}
 	}
 
-	// Inject memory context
-	memoryCtx := l.memory.GetMemoryContext(l.cfg.Memory.DailyNotesDays)
-	if memoryCtx != "" {
-		initialPrompt = memoryCtx + "\n\n---\n\n" + initialPrompt
-	}
-
-	return l.runPiAgent(ctx, initialPrompt)
+	return l.runAgentLoop(ctx, initialPrompt)
 }
 
 // Stop stops the agent loop.
@@ -86,110 +103,193 @@ func (l *Loop) Stop() {
 	}
 
 	close(l.stopChan)
-
-	// Terminate the Pi Agent process if running
-	if l.currentProc != nil {
-		l.currentProc.Signal(os.Interrupt)
-	}
 }
 
-// runPiAgent executes the Pi Agent with the given prompt.
-func (l *Loop) runPiAgent(ctx context.Context, prompt string) error {
-	logger.InfoCF("agent", "Starting Pi Agent", map[string]interface{}{
-		"pi_path":   l.cfg.PiAgentPath,
+// runAgentLoop executes the main agent loop.
+func (l *Loop) runAgentLoop(ctx context.Context, userPrompt string) error {
+	logger.InfoCF("agent", "Starting agent loop", map[string]interface{}{
+		"model":     l.cfg.Agents.Model,
 		"workspace": l.cfg.WorkspacePath(),
 	})
 
-	// Build command
-	args := []string{
-		"--print",
-		"--verbose",
-		"--workspace", l.cfg.WorkspacePath(),
-		"--message", prompt,
-	}
+	// Build initial messages
+	messages := l.buildInitialMessages(userPrompt)
 
-	cmd := exec.CommandContext(ctx, l.cfg.PiAgentPath, args...)
-	cmd.Dir = l.cfg.WorkspacePath()
+	// Get tool definitions
+	toolDefs := l.buildToolDefinitions()
 
-	// Set up pipes
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
-
-	// Start the process
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start Pi Agent: %w", err)
-	}
-
-	l.mu.Lock()
-	l.currentProc = cmd.Process
-	l.mu.Unlock()
-
-	// Stream output
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		l.streamOutput(stdout, os.Stdout, "stdout")
-	}()
-
-	go func() {
-		defer wg.Done()
-		l.streamOutput(stderr, os.Stderr, "stderr")
-	}()
-
-	// Wait for completion
-	wg.Wait()
-	err = cmd.Wait()
-
-	l.mu.Lock()
-	l.currentProc = nil
-	l.mu.Unlock()
-
-	if err != nil {
-		// Check if this was a context length error
-		if l.detectContextOverflow(err) {
-			return l.handleContextOverflow(ctx)
+	// Main loop
+	for iteration := 0; iteration < l.cfg.Agents.MaxToolIterations; iteration++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-l.stopChan:
+			return nil
+		default:
 		}
-		return fmt.Errorf("Pi Agent exited with error: %w", err)
+
+		logger.DebugCF("agent", "LLM iteration", map[string]interface{}{
+			"iteration": iteration + 1,
+			"max":       l.cfg.Agents.MaxToolIterations,
+		})
+
+		// Call LLM
+		resp, err := l.provider.Chat(ctx, messages, toolDefs, l.cfg.Agents.Model, map[string]interface{}{
+			"max_tokens":  l.cfg.Agents.MaxTokens,
+			"temperature": l.cfg.Agents.Temperature,
+		})
+
+		if err != nil {
+			// Check for context overflow
+			if l.detectContextOverflow(err) {
+				return l.handleContextOverflow()
+			}
+			return fmt.Errorf("LLM call failed: %w", err)
+		}
+
+		// Log usage
+		logger.InfoCF("agent", "LLM response", map[string]interface{}{
+			"tokens_in":   resp.Usage.PromptTokens,
+			"tokens_out":  resp.Usage.CompletionTokens,
+			"tool_calls":  len(resp.ToolCalls),
+			"has_content": resp.Content != "",
+		})
+
+		// If no tool calls, we're done
+		if len(resp.ToolCalls) == 0 {
+			if resp.Content != "" {
+				fmt.Println(resp.Content)
+			}
+			return nil
+		}
+
+		// Print any content before tool calls
+		if resp.Content != "" {
+			fmt.Println(resp.Content)
+		}
+
+		// Build assistant message with tool calls
+		assistantMsg := providers.Message{
+			Role:    "assistant",
+			Content: resp.Content,
+		}
+		for _, tc := range resp.ToolCalls {
+			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
+				ID:        tc.ID,
+				Type:      "function",
+				Name:      tc.Name,
+				Arguments: tc.Arguments,
+				Function:  tc.Function,
+			})
+		}
+		messages = append(messages, assistantMsg)
+
+		// Execute tool calls
+		for _, tc := range resp.ToolCalls {
+			logger.InfoCF("agent", fmt.Sprintf("Tool: %s", tc.Name), map[string]interface{}{
+				"args": utils.Truncate(fmt.Sprintf("%v", tc.Arguments), 100),
+			})
+
+			result, err := l.tools.Execute(ctx, tc.Name, tc.Arguments)
+			if err != nil {
+				result = fmt.Sprintf("Error: %v", err)
+				logger.WarnCF("agent", "Tool execution failed", map[string]interface{}{
+					"tool":  tc.Name,
+					"error": err.Error(),
+				})
+			}
+
+			// Truncate long results for display
+			displayResult := utils.Truncate(result, 200)
+			fmt.Printf("  → %s\n", displayResult)
+
+			// Add tool result to messages
+			messages = append(messages, providers.Message{
+				Role:       "tool",
+				Content:    result,
+				ToolCallID: tc.ID,
+			})
+		}
+
+		// Check for strategic compact boundary
+		if l.cfg.StrategicCompact.Enabled && resp.Content != "" {
+			l.checkStrategicBoundary(resp.Content)
+		}
 	}
+
+	logger.WarnCF("agent", "Max iterations reached", map[string]interface{}{
+		"max": l.cfg.Agents.MaxToolIterations,
+	})
 
 	return nil
 }
 
-// streamOutput streams output from a reader to a writer.
-func (l *Loop) streamOutput(r io.Reader, w io.Writer, name string) {
-	scanner := bufio.NewScanner(r)
-	// Increase buffer size for long lines
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+// buildInitialMessages creates the initial message list.
+func (l *Loop) buildInitialMessages(userPrompt string) []providers.Message {
+	var messages []providers.Message
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Fprintln(w, line)
+	// System prompt with memory context
+	systemPrompt := l.buildSystemPrompt()
+	messages = append(messages, providers.Message{
+		Role:    "system",
+		Content: systemPrompt,
+	})
 
-		// Check for strategic compact boundary
-		if l.cfg.StrategicCompact.Enabled {
-			l.checkStrategicBoundary(line)
-		}
-	}
+	// User message
+	messages = append(messages, providers.Message{
+		Role:    "user",
+		Content: userPrompt,
+	})
+
+	return messages
 }
 
-// checkStrategicBoundary checks if a line indicates a strategic compact boundary.
-func (l *Loop) checkStrategicBoundary(line string) {
+// buildSystemPrompt creates the system prompt with memory context.
+func (l *Loop) buildSystemPrompt() string {
+	basePrompt := `You are DomiClaw, an AI coding assistant. You help users with software engineering tasks.
+
+You have access to tools for reading and writing files, listing directories, and executing commands.
+Use these tools to help the user accomplish their tasks.
+
+Be concise and helpful. Focus on completing the task efficiently.
+`
+
+	// Add memory context
+	memoryCtx := l.memory.GetMemoryContext(l.cfg.Memory.DailyNotesDays)
+	if memoryCtx != "" {
+		basePrompt += "\n---\n\n" + memoryCtx
+	}
+
+	return basePrompt
+}
+
+// buildToolDefinitions creates tool definitions for the LLM.
+func (l *Loop) buildToolDefinitions() []providers.ToolDefinition {
+	defs := l.tools.GetDefinitions()
+	var result []providers.ToolDefinition
+
+	for _, def := range defs {
+		fn := def["function"].(map[string]interface{})
+		result = append(result, providers.ToolDefinition{
+			Type: "function",
+			Function: providers.ToolFunctionDefinition{
+				Name:        fn["name"].(string),
+				Description: fn["description"].(string),
+				Parameters:  fn["parameters"].(map[string]interface{}),
+			},
+		})
+	}
+
+	return result
+}
+
+// checkStrategicBoundary checks for strategic compact boundary patterns.
+func (l *Loop) checkStrategicBoundary(content string) {
 	for _, pattern := range l.cfg.StrategicCompact.BoundaryPatterns {
-		if strings.Contains(line, pattern) {
+		if strings.Contains(content, pattern) {
 			logger.InfoCF("agent", "Strategic boundary detected", map[string]interface{}{
 				"pattern": pattern,
 			})
-			// Log to daily notes
 			l.memory.AppendToday(fmt.Sprintf("## Strategic Boundary: %s\n\nDetected at %s\n",
 				pattern, time.Now().Format("15:04:05")))
 			return
@@ -197,18 +297,18 @@ func (l *Loop) checkStrategicBoundary(line string) {
 	}
 }
 
-// detectContextOverflow checks if the error indicates context overflow.
+// detectContextOverflow checks if an error indicates context overflow.
 func (l *Loop) detectContextOverflow(err error) bool {
-	errStr := err.Error()
-	overflowPatterns := []string{
+	errStr := strings.ToLower(err.Error())
+	patterns := []string{
 		"context_length_exceeded",
 		"maximum context length",
 		"token limit",
 		"too many tokens",
 	}
 
-	for _, pattern := range overflowPatterns {
-		if strings.Contains(strings.ToLower(errStr), pattern) {
+	for _, pattern := range patterns {
+		if strings.Contains(errStr, pattern) {
 			return true
 		}
 	}
@@ -216,27 +316,18 @@ func (l *Loop) detectContextOverflow(err error) bool {
 	return false
 }
 
-// handleContextOverflow handles context overflow by triggering recovery.
-func (l *Loop) handleContextOverflow(ctx context.Context) error {
+// handleContextOverflow handles context overflow by creating recovery files.
+func (l *Loop) handleContextOverflow() error {
 	logger.WarnCF("agent", "Context overflow detected, initiating recovery", nil)
 
-	// Generate session ID
 	sessionID := fmt.Sprintf("session_%d", time.Now().Unix())
 
 	// Write resume trigger
-	if err := l.memory.WriteResumeTrigger(sessionID, "context_overflow"); err != nil {
-		logger.ErrorCF("agent", "Failed to write resume trigger", map[string]interface{}{
-			"error": err.Error(),
-		})
-	}
+	l.memory.WriteResumeTrigger(sessionID, "context_overflow")
 
 	// Generate gap analysis prompt
 	gapPrompt := l.generateGapAnalysisPrompt()
-	if err := l.memory.WriteResumePrompt(gapPrompt); err != nil {
-		logger.ErrorCF("agent", "Failed to write resume prompt", map[string]interface{}{
-			"error": err.Error(),
-		})
-	}
+	l.memory.WriteResumePrompt(gapPrompt)
 
 	// Log to daily notes
 	l.memory.AppendToday(fmt.Sprintf(`## Context Overflow Recovery
@@ -277,4 +368,15 @@ You are resuming from a context overflow. Before continuing:
 
 Please perform gap analysis and then continue the task.
 `, memoryCtx)
+}
+
+// GetTools returns the tool registry for external access.
+func (l *Loop) GetTools() *tools.Registry {
+	return l.tools
+}
+
+// Helper for JSON marshaling tool call arguments
+func marshalArgs(args map[string]interface{}) string {
+	data, _ := json.Marshal(args)
+	return string(data)
 }
