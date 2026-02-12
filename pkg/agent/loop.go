@@ -33,25 +33,24 @@ type Loop struct {
 
 // NewLoop creates a new agent loop.
 func NewLoop(cfg *config.Config) (*Loop, error) {
-	// Get API key
-	apiKey := cfg.GetAnthropicAPIKey()
-	if apiKey == "" {
-		return nil, fmt.Errorf("ANTHROPIC_API_KEY not set. Set it via environment variable or config file")
+	// Create provider based on config
+	provider, err := createProvider(cfg)
+	if err != nil {
+		return nil, err
 	}
 
-	// Create provider
-	var apiBase string
-	if cfg.Providers.Anthropic != nil {
-		apiBase = cfg.Providers.Anthropic.APIBase
-	}
-	provider := providers.NewAnthropicProvider(apiKey, apiBase)
-
-	// Create tool registry
+	// Create tool registry with all available tools
 	toolRegistry := tools.NewRegistry()
 	toolRegistry.Register(&tools.ReadFileTool{})
 	toolRegistry.Register(&tools.WriteFileTool{Workspace: cfg.WorkspacePath()})
 	toolRegistry.Register(&tools.ListDirTool{})
+	toolRegistry.Register(&tools.EditFileTool{Workspace: cfg.WorkspacePath()})
 	toolRegistry.Register(tools.NewExecTool(cfg.WorkspacePath()))
+
+	// Register web search if API key available
+	if searchKey := cfg.GetSearchAPIKey(); searchKey != "" {
+		toolRegistry.Register(tools.NewWebSearchTool(searchKey, cfg.Tools.Web.Search.MaxResults))
+	}
 
 	return &Loop{
 		cfg:      cfg,
@@ -379,4 +378,25 @@ func (l *Loop) GetTools() *tools.Registry {
 func marshalArgs(args map[string]interface{}) string {
 	data, _ := json.Marshal(args)
 	return string(data)
+}
+
+// createProvider creates the appropriate LLM provider based on config.
+func createProvider(cfg *config.Config) (providers.Provider, error) {
+	// Try OpenRouter first if configured
+	if apiKey := cfg.GetOpenRouterAPIKey(); apiKey != "" {
+		logger.Info("Using OpenRouter provider")
+		return providers.NewOpenRouterProvider(apiKey), nil
+	}
+
+	// Fall back to Anthropic
+	if apiKey := cfg.GetAnthropicAPIKey(); apiKey != "" {
+		var apiBase string
+		if cfg.Providers.Anthropic != nil {
+			apiBase = cfg.Providers.Anthropic.APIBase
+		}
+		logger.Info("Using Anthropic provider")
+		return providers.NewAnthropicProvider(apiKey, apiBase), nil
+	}
+
+	return nil, fmt.Errorf("no API key configured. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY")
 }

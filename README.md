@@ -5,9 +5,10 @@
 ## Features
 
 - **Standalone Agent**: Direct LLM API calls, no external dependencies
+- **Multi-Provider**: Anthropic and OpenRouter support
 - **Memory System**: Long-term memory (MEMORY.md) + daily logs
 - **Session Recovery**: Automatic gap analysis after context overflow
-- **Built-in Tools**: File operations, command execution
+- **Built-in Tools**: File ops, code editing, command execution, web search
 - **Secure**: API keys via environment variables (never stored in config)
 - **Single Binary**: Cross-platform, ~10MB compiled
 
@@ -39,7 +40,7 @@ domiclaw/
     ├── config/         # Configuration management
     ├── memory/         # Memory system (MEMORY.md, daily logs)
     ├── session/        # Session management
-    ├── providers/      # LLM providers (Anthropic)
+    ├── providers/      # LLM providers (Anthropic, OpenRouter)
     ├── tools/          # Built-in tools
     ├── heartbeat/      # Heartbeat service
     ├── logger/         # Structured logging
@@ -105,8 +106,12 @@ Config file: `~/.domiclaw/config.json`
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| `ANTHROPIC_API_KEY` | Yes* | Anthropic API key |
+| `OPENROUTER_API_KEY` | Yes* | OpenRouter API key (alternative to Anthropic) |
 | `BRAVE_API_KEY` | No | Brave Search API key |
+| `TAVILY_API_KEY` | No | Tavily Search API key (alternative to Brave) |
+
+*One of `ANTHROPIC_API_KEY` or `OPENROUTER_API_KEY` is required.
 
 **Security**: API keys are read from environment variables first. Never commit keys to config files.
 
@@ -116,8 +121,10 @@ Config file: `~/.domiclaw/config.json`
 |------|-------------|
 | `read_file` | Read file contents |
 | `write_file` | Write content to file |
+| `edit_file` | Precise string replacement in files |
 | `list_dir` | List directory contents |
-| `exec` | Execute shell commands |
+| `exec` | Execute shell commands (with dangerous command blocking) |
+| `web_search` | Search the web (Brave or Tavily) |
 
 ## Comparison
 
