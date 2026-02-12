@@ -71,8 +71,14 @@ Examples:
   domiclaw resume
 
 Environment Variables:
-  ANTHROPIC_API_KEY    Anthropic API key (required)
-  BRAVE_API_KEY        Brave Search API key (optional)
+  ANTHROPIC_API_KEY    Anthropic API key
+  ANTHROPIC_BASE_URL   Custom Anthropic proxy (e.g. https://api.like-ai.cc)
+  HONOURSOFT_API_KEY   Honoursoft proxy API key (OpenAI-compatible)
+  HONOURSOFT_BASE_URL  Honoursoft proxy base URL
+  OPENROUTER_API_KEY   OpenRouter API key
+  TAVILY_API_KEY       Tavily search API key
+  TAVILY_API_KEY_1~5   Tavily keys for rotation (auto-random)
+  BRAVE_API_KEY        Brave Search API key
 
 Configuration: ~/.domiclaw/config.json
 `)
@@ -270,10 +276,28 @@ func runStatus() {
 
 	mem := memory.NewStore(cfg.WorkspacePath())
 
-	// Check API key
+	// Check API key and provider
 	apiKeyStatus := "not set"
+	providerName := "none"
 	if cfg.GetAnthropicAPIKey() != "" {
 		apiKeyStatus = "configured"
+		if base := cfg.GetAnthropicAPIBase(); base != "" {
+			providerName = fmt.Sprintf("anthropic (proxy: %s)", base)
+		} else {
+			providerName = "anthropic (direct)"
+		}
+	} else if cfg.GetHonoursoftAPIKey() != "" {
+		apiKeyStatus = "configured"
+		providerName = fmt.Sprintf("honoursoft (%s)", cfg.GetHonoursoftAPIBase())
+	} else if cfg.GetOpenRouterAPIKey() != "" {
+		apiKeyStatus = "configured"
+		providerName = "openrouter"
+	}
+
+	// Check search key
+	searchKeyStatus := "not set"
+	if cfg.GetSearchAPIKey() != "" {
+		searchKeyStatus = "configured"
 	}
 
 	fmt.Printf(`DomiClaw Status
@@ -283,7 +307,9 @@ Workspace:      %s
 Config:         %s
 Model:          %s
 
+Provider:       %s
 API Key:        %s
+Search Key:     %s
 
 Memory:
   Long-term:    %v
@@ -297,7 +323,9 @@ Pending Resume: %v
 		cfg.WorkspacePath(),
 		config.ConfigPath(),
 		cfg.Agents.Model,
+		providerName,
 		apiKeyStatus,
+		searchKeyStatus,
 		mem.ReadLongTerm() != "",
 		cfg.MemoryDir(),
 		boolToStatus(cfg.Heartbeat.Enabled),

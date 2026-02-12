@@ -55,10 +55,28 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// StreamEvent represents a streaming event from the LLM.
+type StreamEvent struct {
+	Type   string // "text", "tool_start", "tool_delta", "tool_end", "done", "error"
+	Text   string // For "text" events
+	ToolID string // For tool events
+	Name   string // For "tool_start"
+	Input  string // For "tool_delta" (partial JSON)
+	Usage  *Usage // For "done" events
+	Error  string // For "error" events
+}
+
+// StreamCallback is called for each streaming event.
+type StreamCallback func(event StreamEvent)
+
 // Provider is the interface for LLM providers.
 type Provider interface {
 	// Chat sends a chat request and returns the response.
 	Chat(ctx context.Context, messages []Message, tools []ToolDefinition, model string, options map[string]interface{}) (*Response, error)
+
+	// ChatStream sends a chat request and streams the response via callback.
+	// Returns the final aggregated response when complete.
+	ChatStream(ctx context.Context, messages []Message, tools []ToolDefinition, model string, options map[string]interface{}, callback StreamCallback) (*Response, error)
 
 	// Name returns the provider name.
 	Name() string

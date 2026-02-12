@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -39,20 +40,39 @@ func NewLoop(cfg *config.Config) (*Loop, error) {
 		return nil, err
 	}
 
+	// Determine working directory for command execution
+	// Use current working directory (where user ran domiclaw), not the internal workspace
+	workingDir, err := os.Getwd()
+	if err != nil {
+		workingDir = cfg.WorkspacePath()
+	}
+
 	// Create tool registry with all available tools
 	toolRegistry := tools.NewRegistry()
 	toolRegistry.Register(&tools.ReadFileTool{})
-	toolRegistry.Register(&tools.WriteFileTool{Workspace: cfg.WorkspacePath()})
+	toolRegistry.Register(&tools.WriteFileTool{Workspace: workingDir})
 	toolRegistry.Register(&tools.ListDirTool{})
-	toolRegistry.Register(&tools.EditFileTool{Workspace: cfg.WorkspacePath()})
-	toolRegistry.Register(&tools.GlobTool{Workspace: cfg.WorkspacePath()})
-	toolRegistry.Register(&tools.GrepTool{Workspace: cfg.WorkspacePath()})
-	toolRegistry.Register(tools.NewExecTool(cfg.WorkspacePath()))
+	toolRegistry.Register(&tools.EditFileTool{Workspace: workingDir})
+	toolRegistry.Register(&tools.GlobTool{Workspace: workingDir})
+	toolRegistry.Register(&tools.GrepTool{Workspace: workingDir})
+	toolRegistry.Register(tools.NewExecTool(workingDir))
 
 	// Register web search if API key available
 	if searchKey := cfg.GetSearchAPIKey(); searchKey != "" {
 		toolRegistry.Register(tools.NewWebSearchTool(searchKey, cfg.Tools.Web.Search.MaxResults))
 	}
+
+	// Register aliases for Claude model compatibility
+	// Claude models are trained with specific tool names from Claude Code
+	toolRegistry.RegisterAlias("Bash", "exec")
+	toolRegistry.RegisterAlias("bash", "exec")
+	toolRegistry.RegisterAlias("Read", "read_file")
+	toolRegistry.RegisterAlias("Write", "write_file")
+	toolRegistry.RegisterAlias("Edit", "edit_file")
+	toolRegistry.RegisterAlias("Glob", "glob")
+	toolRegistry.RegisterAlias("Grep", "grep")
+	toolRegistry.RegisterAlias("LS", "list_dir")
+	toolRegistry.RegisterAlias("WebSearch", "web_search")
 
 	return &Loop{
 		cfg:      cfg,
@@ -120,6 +140,10 @@ func (l *Loop) runAgentLoop(ctx context.Context, userPrompt string) error {
 	toolDefs := l.buildToolDefinitions()
 
 	// Main loop
+	var lastToolSig string
+	repeatCount := 0
+	const maxRepeats = 2
+
 	for iteration := 0; iteration < l.cfg.Agents.MaxToolIterations; iteration++ {
 		select {
 		case <-ctx.Done():
@@ -134,11 +158,45 @@ func (l *Loop) runAgentLoop(ctx context.Context, userPrompt string) error {
 			"max":       l.cfg.Agents.MaxToolIterations,
 		})
 
-		// Call LLM
-		resp, err := l.provider.Chat(ctx, messages, toolDefs, l.cfg.Agents.Model, map[string]interface{}{
-			"max_tokens":  l.cfg.Agents.MaxTokens,
-			"temperature": l.cfg.Agents.Temperature,
-		})
+		// Call LLM with streaming (with retry for rate limits)
+		var resp *providers.Response
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			resp, err = l.provider.ChatStream(ctx, messages, toolDefs, l.cfg.Agents.Model, map[string]interface{}{
+				"max_tokens":  l.cfg.Agents.MaxTokens,
+				"temperature": l.cfg.Agents.Temperature,
+			}, func(event providers.StreamEvent) {
+				switch event.Type {
+				case "text":
+					fmt.Print(event.Text)
+				case "tool_start":
+					fmt.Printf("\n[tool: %s] ", event.Name)
+				case "done":
+					// Print newline after streamed text
+				}
+			})
+			if err == nil {
+				break
+			}
+			// Retry on rate limit errors
+			errStr := strings.ToLower(err.Error())
+			if strings.Contains(errStr, "rate_limit") || strings.Contains(errStr, "too many") || strings.Contains(errStr, "429") {
+				backoff := time.Duration(5*(attempt+1)) * time.Second
+				logger.WarnCF("agent", "Rate limited, retrying", map[string]interface{}{
+					"attempt": attempt + 1,
+					"backoff": backoff.String(),
+				})
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-l.stopChan:
+					return nil
+				case <-time.After(backoff):
+					continue
+				}
+			}
+			break // Non-retryable error
+		}
 
 		if err != nil {
 			// Check for context overflow
@@ -159,26 +217,27 @@ func (l *Loop) runAgentLoop(ctx context.Context, userPrompt string) error {
 		// If no tool calls, we're done
 		if len(resp.ToolCalls) == 0 {
 			if resp.Content != "" {
-				fmt.Println(resp.Content)
+				fmt.Println() // newline after streamed text
 			}
 			return nil
 		}
 
-		// Print any content before tool calls
+		// Print newline after streamed content before tool execution output
 		if resp.Content != "" {
-			fmt.Println(resp.Content)
+			fmt.Println()
 		}
 
-		// Build assistant message with tool calls
+		// Build assistant message with tool calls (use resolved canonical names)
 		assistantMsg := providers.Message{
 			Role:    "assistant",
 			Content: resp.Content,
 		}
 		for _, tc := range resp.ToolCalls {
+			resolvedName := l.tools.ResolveName(tc.Name)
 			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
 				ID:        tc.ID,
 				Type:      "function",
-				Name:      tc.Name,
+				Name:      resolvedName,
 				Arguments: tc.Arguments,
 				Function:  tc.Function,
 			})
@@ -187,7 +246,8 @@ func (l *Loop) runAgentLoop(ctx context.Context, userPrompt string) error {
 
 		// Execute tool calls
 		for _, tc := range resp.ToolCalls {
-			logger.InfoCF("agent", fmt.Sprintf("Tool: %s", tc.Name), map[string]interface{}{
+			resolvedName := l.tools.ResolveName(tc.Name)
+			logger.InfoCF("agent", fmt.Sprintf("Tool: %s", resolvedName), map[string]interface{}{
 				"args": utils.Truncate(fmt.Sprintf("%v", tc.Arguments), 100),
 			})
 
@@ -210,6 +270,28 @@ func (l *Loop) runAgentLoop(ctx context.Context, userPrompt string) error {
 				Content:    result,
 				ToolCallID: tc.ID,
 			})
+		}
+
+		// Detect repeated identical tool calls to break infinite loops
+		currentSig := marshalArgs(resp.ToolCalls[0].Arguments) + ":" + resp.ToolCalls[0].Name
+		if currentSig == lastToolSig {
+			repeatCount++
+			if repeatCount >= maxRepeats {
+				logger.WarnCF("agent", "Breaking tool call loop - same call repeated", map[string]interface{}{
+					"tool":    resp.ToolCalls[0].Name,
+					"repeats": repeatCount + 1,
+				})
+				// Add a hint to the model to stop repeating
+				messages = append(messages, providers.Message{
+					Role:    "user",
+					Content: "You are repeating the same tool call. Please use the results you already have and provide your final answer. Do not make any more tool calls.",
+				})
+				lastToolSig = ""
+				repeatCount = 0
+			}
+		} else {
+			lastToolSig = currentSig
+			repeatCount = 0
 		}
 
 		// Check for strategic compact boundary
@@ -247,13 +329,27 @@ func (l *Loop) buildInitialMessages(userPrompt string) []providers.Message {
 
 // buildSystemPrompt creates the system prompt with memory context.
 func (l *Loop) buildSystemPrompt() string {
-	basePrompt := `You are DomiClaw, an AI coding assistant. You help users with software engineering tasks.
+	// List available tool names
+	toolNames := strings.Join(l.tools.List(), ", ")
 
-You have access to tools for reading and writing files, listing directories, and executing commands.
-Use these tools to help the user accomplish their tasks.
+	basePrompt := fmt.Sprintf(`You are DomiClaw, an AI coding assistant. You help users with software engineering tasks.
+
+You have the following tools available: %s
+
+Tool usage:
+- Use "exec" to run shell commands (bash/sh). The argument is "command" (string).
+- Use "read_file" to read file contents. The argument is "path" (string).
+- Use "write_file" to create/overwrite files. Arguments: "path" and "content".
+- Use "edit_file" to make targeted edits. Arguments: "path", "old_string", "new_string".
+- Use "list_dir" to list directory contents. The argument is "path" (string).
+- Use "glob" to find files by pattern. The argument is "pattern" (string).
+- Use "grep" to search file contents. Arguments: "pattern" and optionally "path", "include".
+- Use "web_search" to search the web. The argument is "query" (string).
+
+IMPORTANT: Only use the tool names listed above. Do NOT use tool names like "Bash", "Read", "Write", etc.
 
 Be concise and helpful. Focus on completing the task efficiently.
-`
+`, toolNames)
 
 	// Add memory context
 	memoryCtx := l.memory.GetMemoryContext(l.cfg.Memory.DailyNotesDays)
@@ -383,22 +479,38 @@ func marshalArgs(args map[string]interface{}) string {
 }
 
 // createProvider creates the appropriate LLM provider based on config.
+// Priority: 1. Anthropic (with optional custom proxy), 2. Honoursoft (OpenAI-compatible), 3. OpenRouter
 func createProvider(cfg *config.Config) (providers.Provider, error) {
-	// Try OpenRouter first if configured
+	// Try Anthropic first (supports like-ai.cc proxy via ANTHROPIC_BASE_URL)
+	if apiKey := cfg.GetAnthropicAPIKey(); apiKey != "" {
+		apiBase := cfg.GetAnthropicAPIBase()
+		if apiBase != "" {
+			logger.InfoCF("provider", "Using Anthropic provider (custom proxy)", map[string]interface{}{
+				"base_url": apiBase,
+			})
+		} else {
+			logger.Info("Using Anthropic provider (direct)")
+		}
+		return providers.NewAnthropicProvider(apiKey, apiBase), nil
+	}
+
+	// Try Honoursoft (OpenAI-compatible proxy)
+	if apiKey := cfg.GetHonoursoftAPIKey(); apiKey != "" {
+		apiBase := cfg.GetHonoursoftAPIBase()
+		if apiBase == "" {
+			return nil, fmt.Errorf("HONOURSOFT_API_KEY set but no base URL. Set HONOURSOFT_BASE_URL")
+		}
+		logger.InfoCF("provider", "Using Honoursoft provider", map[string]interface{}{
+			"base_url": apiBase,
+		})
+		return providers.NewOpenAICompatibleProvider("honoursoft", apiKey, apiBase), nil
+	}
+
+	// Try OpenRouter
 	if apiKey := cfg.GetOpenRouterAPIKey(); apiKey != "" {
 		logger.Info("Using OpenRouter provider")
 		return providers.NewOpenRouterProvider(apiKey), nil
 	}
 
-	// Fall back to Anthropic
-	if apiKey := cfg.GetAnthropicAPIKey(); apiKey != "" {
-		var apiBase string
-		if cfg.Providers.Anthropic != nil {
-			apiBase = cfg.Providers.Anthropic.APIBase
-		}
-		logger.Info("Using Anthropic provider")
-		return providers.NewAnthropicProvider(apiKey, apiBase), nil
-	}
-
-	return nil, fmt.Errorf("no API key configured. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY")
+	return nil, fmt.Errorf("no API key configured. Set ANTHROPIC_API_KEY, HONOURSOFT_API_KEY, or OPENROUTER_API_KEY")
 }

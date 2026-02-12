@@ -3,6 +3,8 @@ package tools
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -23,14 +25,16 @@ type Tool interface {
 
 // Registry manages available tools.
 type Registry struct {
-	tools map[string]Tool
-	mu    sync.RWMutex
+	tools   map[string]Tool
+	aliases map[string]string // alias -> canonical name
+	mu      sync.RWMutex
 }
 
 // NewRegistry creates a new tool registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		tools: make(map[string]Tool),
+		tools:   make(map[string]Tool),
+		aliases: make(map[string]string),
 	}
 }
 
@@ -41,11 +45,37 @@ func (r *Registry) Register(tool Tool) {
 	r.tools[tool.Name()] = tool
 }
 
-// Get retrieves a tool by name.
+// RegisterAlias maps an alias name to a canonical tool name.
+// This allows models that expect different tool names (e.g. "Bash" instead of "exec")
+// to work seamlessly.
+func (r *Registry) RegisterAlias(alias, canonical string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.aliases[strings.ToLower(alias)] = canonical
+}
+
+// resolveAlias resolves a tool name through aliases (case-insensitive).
+func (r *Registry) resolveAlias(name string) string {
+	if canonical, ok := r.aliases[strings.ToLower(name)]; ok {
+		return canonical
+	}
+	return name
+}
+
+// ResolveName returns the canonical tool name for a given name (resolving aliases).
+// This should be used when recording tool calls back into message history.
+func (r *Registry) ResolveName(name string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.resolveAlias(name)
+}
+
+// Get retrieves a tool by name (with alias resolution).
 func (r *Registry) Get(name string) (Tool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	tool, ok := r.tools[name]
+	resolved := r.resolveAlias(name)
+	tool, ok := r.tools[resolved]
 	return tool, ok
 }
 
@@ -83,11 +113,15 @@ func (r *Registry) GetDefinitions() []map[string]interface{} {
 // Execute runs a tool by name with the given arguments.
 func (r *Registry) Execute(ctx context.Context, name string, args map[string]interface{}) (string, error) {
 	r.mu.RLock()
-	tool, ok := r.tools[name]
+	resolved := r.resolveAlias(name)
+	tool, ok := r.tools[resolved]
 	r.mu.RUnlock()
 
 	if !ok {
-		return "", &ToolNotFoundError{Name: name}
+		return "", &ToolNotFoundError{
+			Name:           name,
+			AvailableTools: r.List(),
+		}
 	}
 
 	return tool.Execute(ctx, args)
@@ -95,9 +129,10 @@ func (r *Registry) Execute(ctx context.Context, name string, args map[string]int
 
 // ToolNotFoundError is returned when a tool is not found.
 type ToolNotFoundError struct {
-	Name string
+	Name           string
+	AvailableTools []string
 }
 
 func (e *ToolNotFoundError) Error() string {
-	return "tool not found: " + e.Name
+	return fmt.Sprintf("tool not found: %s. Available tools: %s", e.Name, strings.Join(e.AvailableTools, ", "))
 }

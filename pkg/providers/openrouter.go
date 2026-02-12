@@ -13,16 +13,36 @@ import (
 
 const openRouterAPIURL = "https://openrouter.ai/api/v1/chat/completions"
 
-// OpenRouterProvider implements the Provider interface for OpenRouter.
+// OpenRouterProvider implements the Provider interface for OpenRouter
+// and any OpenAI-compatible API endpoint.
 type OpenRouterProvider struct {
-	apiKey string
-	client *http.Client
+	apiKey  string
+	apiBase string // Full chat completions URL
+	name_   string // Provider name for display
+	client  *http.Client
 }
 
 // NewOpenRouterProvider creates a new OpenRouter provider.
 func NewOpenRouterProvider(apiKey string) *OpenRouterProvider {
 	return &OpenRouterProvider{
-		apiKey: apiKey,
+		apiKey:  apiKey,
+		apiBase: openRouterAPIURL,
+		name_:   "openrouter",
+		client: &http.Client{
+			Timeout: 120 * time.Second,
+		},
+	}
+}
+
+// NewOpenAICompatibleProvider creates a provider for any OpenAI-compatible API.
+// apiBase should be the base URL (e.g. "https://api.example.com").
+// The /v1/chat/completions path is appended automatically.
+func NewOpenAICompatibleProvider(name, apiKey, apiBase string) *OpenRouterProvider {
+	endpoint := apiBase + "/v1/chat/completions"
+	return &OpenRouterProvider{
+		apiKey:  apiKey,
+		apiBase: endpoint,
+		name_:   name,
 		client: &http.Client{
 			Timeout: 120 * time.Second,
 		},
@@ -31,7 +51,7 @@ func NewOpenRouterProvider(apiKey string) *OpenRouterProvider {
 
 // Name returns the provider name.
 func (p *OpenRouterProvider) Name() string {
-	return "openrouter"
+	return p.name_
 }
 
 // OpenRouter uses OpenAI-compatible API format
@@ -169,7 +189,7 @@ func (p *OpenRouterProvider) Chat(ctx context.Context, messages []Message, tools
 	}
 
 	// Create HTTP request
-	req, err := http.NewRequestWithContext(ctx, "POST", openRouterAPIURL, bytes.NewReader(reqData))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase, bytes.NewReader(reqData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -236,4 +256,31 @@ func (p *OpenRouterProvider) Chat(ctx context.Context, messages []Message, tools
 	}
 
 	return result, nil
+}
+
+// ChatStream falls back to non-streaming Chat for OpenRouter/OpenAI-compatible providers.
+// TODO: Implement proper SSE streaming for OpenAI format.
+func (p *OpenRouterProvider) ChatStream(ctx context.Context, messages []Message, tools []ToolDefinition, model string, options map[string]interface{}, callback StreamCallback) (*Response, error) {
+	// Fall back to non-streaming
+	resp, err := p.Chat(ctx, messages, tools, model, options)
+	if err != nil {
+		return nil, err
+	}
+
+	// Emit events for the complete response
+	if callback != nil {
+		if resp.Content != "" {
+			callback(StreamEvent{Type: "text", Text: resp.Content})
+		}
+		for _, tc := range resp.ToolCalls {
+			callback(StreamEvent{Type: "tool_start", ToolID: tc.ID, Name: tc.Name})
+			if tc.Function != nil {
+				callback(StreamEvent{Type: "tool_delta", Input: tc.Function.Arguments})
+			}
+			callback(StreamEvent{Type: "tool_end", ToolID: tc.ID, Name: tc.Name})
+		}
+		callback(StreamEvent{Type: "done", Usage: &resp.Usage})
+	}
+
+	return resp, nil
 }

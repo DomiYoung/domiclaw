@@ -3,8 +3,11 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/DomiYoung/domiclaw/pkg/utils"
 )
@@ -32,6 +35,7 @@ type AgentsConfig struct {
 type ProvidersConfig struct {
 	Anthropic  *ProviderConfig `json:"anthropic,omitempty"`
 	OpenRouter *ProviderConfig `json:"openrouter,omitempty"`
+	Honoursoft *ProviderConfig `json:"honoursoft,omitempty"` // OpenAI-compatible proxy
 }
 
 // ProviderConfig represents a single provider's configuration.
@@ -208,6 +212,23 @@ func (c *Config) GetAnthropicAPIKey() string {
 	return ""
 }
 
+// GetAnthropicAPIBase returns the custom Anthropic API base URL.
+// Priority: 1. Environment variable ANTHROPIC_BASE_URL, 2. Config file
+// Returns empty string if using default Anthropic endpoint.
+func (c *Config) GetAnthropicAPIBase() string {
+	// 1. Try environment variable first
+	if base := os.Getenv("ANTHROPIC_BASE_URL"); base != "" {
+		return strings.TrimRight(base, "/")
+	}
+
+	// 2. Fall back to config file
+	if c.Providers.Anthropic != nil && c.Providers.Anthropic.APIBase != "" {
+		return strings.TrimRight(c.Providers.Anthropic.APIBase, "/")
+	}
+
+	return ""
+}
+
 // GetOpenRouterAPIKey returns the OpenRouter API key.
 func (c *Config) GetOpenRouterAPIKey() string {
 	if key := os.Getenv("OPENROUTER_API_KEY"); key != "" {
@@ -221,13 +242,52 @@ func (c *Config) GetOpenRouterAPIKey() string {
 	return ""
 }
 
+// GetHonoursoftAPIKey returns the Honoursoft proxy API key.
+func (c *Config) GetHonoursoftAPIKey() string {
+	if key := os.Getenv("HONOURSOFT_API_KEY"); key != "" {
+		return key
+	}
+
+	if c.Providers.Honoursoft != nil && c.Providers.Honoursoft.APIKey != "" {
+		return c.Providers.Honoursoft.APIKey
+	}
+
+	return ""
+}
+
+// GetHonoursoftAPIBase returns the Honoursoft proxy base URL.
+func (c *Config) GetHonoursoftAPIBase() string {
+	if base := os.Getenv("HONOURSOFT_BASE_URL"); base != "" {
+		return strings.TrimRight(base, "/")
+	}
+
+	if c.Providers.Honoursoft != nil && c.Providers.Honoursoft.APIBase != "" {
+		return strings.TrimRight(c.Providers.Honoursoft.APIBase, "/")
+	}
+
+	return ""
+}
+
 // GetSearchAPIKey returns the web search API key.
+// Supports: BRAVE_API_KEY, TAVILY_API_KEY, and TAVILY_API_KEY_1~5 rotation.
 func (c *Config) GetSearchAPIKey() string {
 	if key := os.Getenv("BRAVE_API_KEY"); key != "" {
 		return key
 	}
 	if key := os.Getenv("TAVILY_API_KEY"); key != "" {
 		return key
+	}
+
+	// Support TAVILY_API_KEY_1 through TAVILY_API_KEY_5 rotation
+	var tavilyKeys []string
+	for i := 1; i <= 5; i++ {
+		if key := os.Getenv(fmt.Sprintf("TAVILY_API_KEY_%d", i)); key != "" {
+			tavilyKeys = append(tavilyKeys, key)
+		}
+	}
+	if len(tavilyKeys) > 0 {
+		// Random rotation to distribute load
+		return tavilyKeys[rand.Intn(len(tavilyKeys))]
 	}
 
 	return c.Tools.Web.Search.APIKey
