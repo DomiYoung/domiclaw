@@ -3,10 +3,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/DomiYoung/domiclaw/pkg/agent"
@@ -38,6 +40,8 @@ func main() {
 		runInit()
 	case "run":
 		runAgent(os.Args[2:])
+	case "chat":
+		runChat(os.Args[2:])
 	case "resume":
 		runResume()
 	case "status":
@@ -58,7 +62,8 @@ Usage: domiclaw <command> [options]
 
 Commands:
   init      Initialize workspace and config
-  run       Run agent with a prompt
+  run       Run agent with a single prompt
+  chat      Interactive chat mode (REPL)
   resume    Resume from last session (after context overflow)
   status    Show current status
   version   Show version information
@@ -67,7 +72,8 @@ Commands:
 Examples:
   domiclaw init
   domiclaw run -m "Help me refactor this code"
-  domiclaw run --workspace /path/to/project
+  domiclaw chat                    # Enter interactive mode
+  domiclaw chat -w /path/to/proj   # Chat in specific directory
   domiclaw resume
 
 Environment Variables:
@@ -333,6 +339,116 @@ Pending Resume: %v
 		boolToStatus(cfg.StrategicCompact.Enabled),
 		mem.HasPendingResume(),
 	)
+}
+
+func runChat(args []string) {
+	// Parse arguments
+	var workspace string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-w", "--workspace":
+			if i+1 < len(args) {
+				workspace = args[i+1]
+				i++
+			}
+		}
+	}
+
+	// Load config
+	cfg, err := config.Load()
+	if err != nil {
+		logger.ErrorF("Failed to load config", map[string]interface{}{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+
+	// Override workspace if provided
+	if workspace != "" {
+		cfg.Workspace = workspace
+	}
+
+	// Create agent loop
+	loop, err := agent.NewLoop(cfg)
+	if err != nil {
+		logger.ErrorF("Failed to create agent", map[string]interface{}{
+			"error": err.Error(),
+		})
+		fmt.Printf("\nError: %s\n", err.Error())
+		fmt.Println("\nMake sure ANTHROPIC_API_KEY is set.")
+		os.Exit(1)
+	}
+
+	// Setup context with signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Handle Ctrl+C gracefully
+	go func() {
+		<-sigChan
+		fmt.Println("\n\nGoodbye!")
+		loop.Stop()
+		cancel()
+		os.Exit(0)
+	}()
+
+	// Print welcome
+	cwd, _ := os.Getwd()
+	fmt.Printf(`
+DomiClaw Interactive Mode
+==========================
+Workspace: %s
+Type your message and press Enter. Commands:
+  /quit, /exit  - Exit chat
+  /clear        - Clear conversation history
+  /status       - Show status
+
+`, cwd)
+
+	// Interactive loop
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("You: ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+
+		input = strings.TrimSpace(input)
+		if input == "" {
+			continue
+		}
+
+		// Handle commands
+		switch strings.ToLower(input) {
+		case "/quit", "/exit", "/q":
+			fmt.Println("Goodbye!")
+			return
+		case "/clear":
+			loop.ClearHistory()
+			fmt.Println("[Conversation history cleared]")
+			continue
+		case "/status":
+			runStatus()
+			continue
+		}
+
+		// Run agent with input (continues conversation)
+		fmt.Print("\nDomiClaw: ")
+		if err := loop.RunContinue(ctx, input); err != nil {
+			if err == context.Canceled {
+				return
+			}
+			logger.WarnCF("chat", "Agent error", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+		fmt.Println()
+	}
 }
 
 func boolToStatus(b bool) string {
